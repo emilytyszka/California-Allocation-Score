@@ -6,7 +6,8 @@ determine_eligible_models <- function(forecast_dates, locations){
   ## drop CU non-primary models: CU-nochange, CU-scenario_low, CU-scenario_mid
   
   models_to_drop <- c("COVIDhub_CDC-ensemble", "COVIDhub-ensemble", "COVIDhub-trained_ensemble",
-                      "CU-nochange", "CU-scenario_low", "CU-scenario_mid", "UChicagoCHATTOPADHYAY-UnIT") # U Chicago dropped from pipeline due to completeness - only reports 3 times
+                      "CU-nochange", "CU-scenario_low", "CU-scenario_mid", "UChicagoCHATTOPADHYAY-UnIT", 
+                      "FAIR-NRAR") # UChicago and FAIR dropped from pipeline due to completeness - only report 3 and 5 times respectively
 
   ## load and filter forecasts
   load_forecasts(

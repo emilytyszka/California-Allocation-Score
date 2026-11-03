@@ -48,6 +48,8 @@ tar_load("baseline3")
 tar_load("resource_constraint_grid")
 tar_load("score_data1wk")
 tar_load("score_data3wk")
+
+options(digits=4, scipen = 999) 
 ```
 
 # Abstract
@@ -59,42 +61,51 @@ In the development and assessment of infectious disease forecasts, modelers stan
 ```{r Data cleaning, message=FALSE, echo=FALSE, warning=FALSE}
 
 # Combine all datasets
+### 1 week scores 
 alloscores1wk <- alloscores1wk %>% mutate(horizon = 1)
 percap1 <- percap1 %>% mutate(horizon = 1)
 baseline1 <- baseline1 %>% mutate(horizon = 1)
+### 3 week scores
 alloscores3wk <- alloscores3wk %>% mutate(horizon = 3) %>%
-  mutate(filterout = paste(model,target_end_date)) %>%                       # CU-select only reporting for 56 counties in wk 3!
+  mutate(filterout = paste(model,target_end_date)) %>%     # CU-select only reporting for 56 counties in wk 3 of 12/18!
   dplyr::filter(filterout != "CU-select 2021-12-18") %>% select(-filterout)
 percap3 <- percap3 %>% mutate(horizon = 3)
 baseline3 <- baseline3 %>% mutate(horizon = 3)
+## Bind
 all_alloscores_data <- rbind(alloscores1wk, alloscores3wk, percap1, percap3, baseline1, baseline3)
 
-# Get and merge with the 90% constraints
-resource_constraints90 <- resource_constraint_grid %>% select(target_end_date, value) %>% 
-  mutate(constraint90 = value*0.90)
-all_alloscores_data90 <- all_alloscores_data %>% merge(resource_constraints90, by = "target_end_date") %>% 
-  dplyr::filter(round(K)==round(constraint90)) %>% select(-constraint90) %>%
+# Merge with the ground truth counts to retrieve resource constraints
+### Ground truth counts (= 'value' column of the grid)
+resource_constraints <- resource_constraint_grid %>% select(target_end_date, value) 
+### Merge all scores with ground truth, calculate % resource constraint, calculate avoidable underallocation ("components" of AS)
+all_alloscores_data <- all_alloscores_data %>% merge(resource_constraints, by = "target_end_date") %>% 
+  mutate(Constraint = as.character(K/value)) %>%
   mutate(filterout = paste(model,target_end_date, horizon)) %>%                       # CU-select - remove again for some reason
-  dplyr::filter(filterout != "CU-select 2021-12-18 3") %>% select(-filterout)
+  dplyr::filter(filterout != "CU-select 2021-12-18 3") %>% select(-filterout) %>%
+  mutate(components = case_when(               # This line gets rid of negatives by turning
+    components < 0 ~  0,                       # neg values (undershoots) to absolute value 
+    components >= 0 ~ abs(`components`)))      # and pos values (overshoots) to 0.
+                         
 
-# Calculate AS
+# Calculate 90% AS
+### 90% alloscore = 0.90 constraint
+all_alloscores_data90 <- all_alloscores_data %>% dplyr::filter(Constraint == 0.9)
+### Sum individual components into scores (model + date + horizon); rank scores (date + horizon)
 all_alloscores <- all_alloscores_data90 %>%
-  group_by(model, target_end_date, horizon) %>%
-  mutate(components = case_when(              # This line gets rid of negatives by turning
-    components <= 0 ~ abs(`components`),      # neg values (undershoots) to absolute value
-    components > 0 ~  0                       # and pos values (overshoots) to 0. Comment 
-  )) %>%                                       # out this chunk to go back to the old method.
+  group_by(model, target_end_date, horizon) %>%              # absolute value calculation already done above
   summarize(alloscore = sum(components), yobs = sum(y)) %>%
   group_by(target_end_date, horizon) %>%
   mutate(nmodels = n(),
          allo_rank = rank(alloscore, ties.method = "min"),
          allo_rank_std = 1- (allo_rank-1)/(nmodels-1)) %>%
   ungroup() %>%
-  complete(model, target_end_date) %>%
-  mutate(target_end_date = as.Date(target_end_date)) 
+  #complete(model, target_end_date) %>%
+  mutate(target_end_date = as.Date(target_end_date)) %>% select(-nmodels)
 
-# Retrieve other scores
+
+# MWIS
 alloscore_models <- unique(all_alloscores$model)
+### Retrieve 1 week scores and rank (date)
 score_data_summaries1 <- score_data1wk %>%
   dplyr::filter(model %in% alloscore_models) %>%
   group_by(model, target_end_date) %>%
@@ -106,6 +117,7 @@ score_data_summaries1 <- score_data1wk %>%
          MWIS_rank_std = 1- (MWIS_rank-1)/(nmodels-1)) %>%
   ungroup() %>%
   complete(model, target_end_date) %>% mutate(horizon = 1)
+### Retrieve 3 week scores and rank (date)
 score_data_summaries3 <- score_data3wk %>%
   dplyr::filter(model %in% alloscore_models) %>%
   group_by(model, target_end_date) %>%
@@ -117,10 +129,10 @@ score_data_summaries3 <- score_data3wk %>%
          MWIS_rank_std = 1- (MWIS_rank-1)/(nmodels-1)) %>%
   ungroup() %>%
   complete(model, target_end_date) %>% mutate(horizon = 3)
-score_data_summaries <- rbind(score_data_summaries1, score_data_summaries3)
+score_data_summaries <- rbind(score_data_summaries1, score_data_summaries3) %>% select(-nmodels)
 
 # IAS and Weighted IAS
-#Weights
+### Weights
 kprobs <- resource_constraint_grid %>% 
   pivot_longer(!c(target_end_date, value), names_to = "number", values_to = "K") %>% 
   select(-number)
@@ -130,24 +142,29 @@ kprobs <- kprobs %>% group_by(target_end_date) %>%
          mean_k = quantile(K, 0.500),
          weight = dnorm(K, mean = mean_k, sd = (sd1-sd2)/4)/sum(dnorm(K, mean = mean_k, sd = (sd1-sd2)/4))) %>% 
   select(-value, -sd1, -sd2)
-## TEST WEIGHTS
+
+#### VISUALIZE WEIGHTS HERE
 # kprobs %>% ggplot(aes(x=K, y=weight, group = target_end_date, color = target_end_date)) +
 #   geom_point() +
 #   geom_line() #+ scale_x_continuous(transform="log10")
-#view(kprobs %>% group_by(target_end_date) %>% summarise(sum(weight)))
+# view(kprobs %>% group_by(target_end_date) %>% summarise(sum(weight)))
 
-
+### Calculate AS (model + K + horizon + date), IAS uniform (model + horizon + date), IAS weighted (model + horizon + date), rank scores (horizon + date)
 all_ias <- all_alloscores_data %>%
-  group_by(model, K, horizon, target_end_date) %>%
-  summarize(`Allocation score` = sum(components)) %>%
+  group_by(model, K, horizon, target_end_date) %>%         # absolute value calculation already done above
+  summarize(alloscore = sum(components)) %>%
   left_join(kprobs, by=c("target_end_date", "K")) %>%
   group_by(model, horizon, target_end_date) %>%
-  summarize(IAS = mean(`Allocation score`),
-            IAS_wt = sum(`Allocation score`*weight, na.rm=TRUE)) %>% ungroup() %>%
+  summarize(IAS = mean(alloscore),
+            IAS_wt = sum(alloscore*weight, na.rm=TRUE)) %>% ungroup() %>%
   group_by(horizon, target_end_date) %>%
   mutate(ias_rank = rank(IAS, ties.method = "min"),
-         ias_wt_rank = rank(IAS_wt, ties.method = "min")) 
+         ias_wt_rank = rank(IAS_wt, ties.method = "min"),
+         nmodels = n(),
+         ias_rank_std = 1- (ias_rank-1)/(nmodels-1),
+         ias_wt_rank_std = 1- (ias_wt_rank-1)/(nmodels-1)) %>% ungroup() %>% select(-nmodels)
 
+# Combine all scores into big dataset
 all_scores <- left_join(all_alloscores, score_data_summaries,
                       by=c("model", "target_end_date", "horizon")) 
 all_scores <- left_join(all_scores, all_ias,
@@ -181,16 +198,27 @@ As a illustrative example, we will visualize the calculation of an allocation sc
 ```{r echo=FALSE, message=FALSE, warning=FALSE, fig.width = 7, fig.align = 'center', fig.cap= "Visualization of an allocation score at for a model of flatline predictions based on recently observed count data, predicting case counts in California counties (with the exception of Los Angeles) for January 1st, 2022 at the 1 week horizon. The forecast predictions are used to inform the allocation of an abstract resource, set at a contraint of 90% of the ground truth case count for the date of interest. This is compared to an 'oracle' allocation informed by ground truth case counts. In the stacked bar charts, red shading indicates underallocation to a location, blue shading indicates overallocation, and purple shading indicates addressed need. When summed, avoidable underallocation (i.e. underallocation that is not inevitable due to lower-than-needed resources) is found to be 4,175 units."}
 
 targetdateofinterest <- "2022-01-01"
+horizonofinterest <- "1"
+modelofinterest <- "COVIDhub-baseline"
+
+allocation_county_plot <- function(
+    alloscores_data,
+    scores_data,
+    truth_data,
+    targetdateofinterest, 
+    horizonofinterest, 
+    modelofinterest) {
+  
 ordered_levels <- truth_data %>%
-  dplyr::filter(target_end_date == "2022-01-01", location_name != "California") %>%
+  dplyr::filter(target_end_date == targetdateofinterest, location_name != "California") %>%
   select(full_location_name, abbreviation, value) %>%
   arrange(-value)
 
-multiloc_dat <- all_alloscores_data90 %>%
+multiloc_dat <- alloscores_data %>%
   dplyr::filter(target_end_date == targetdateofinterest,
          full_location_name != "Los Angeles County, CA") %>%
-  dplyr::filter(model == "COVIDhub-baseline") %>%
-  dplyr::filter(horizon == "1") %>%
+  dplyr::filter(model == modelofinterest) %>%
+  dplyr::filter(horizon == horizonofinterest) %>%
   rename(allocation = x, `observed resource need` = y) %>%
   mutate(`unmet resource need` = ifelse(allocation < `observed resource need`,
                                         `observed resource need` - allocation,
@@ -211,17 +239,17 @@ multiloc_dat <- all_alloscores_data90 %>%
   arrange(name)
 
 # reorder the model name variable via final alloscore
-as_variable <- all_scores %>% dplyr::filter(target_end_date == targetdateofinterest) %>%
+as_variable <- scores_data %>% dplyr::filter(target_end_date == targetdateofinterest) %>%
   dplyr::filter(horizon == "1")  %>% select(model, alloscore)
 multiloc_dat <- multiloc_dat %>% 
   merge(as_variable, by="model") %>%
   mutate("model" = as.factor(`model`)) 
 multiloc_dat <- multiloc_dat %>%
   mutate(model = fct_reorder(model, .x = alloscore)) %>%
-  dplyr::filter(model == "COVIDhub-baseline") 
+  dplyr::filter(model == modelofinterest) 
 as_variable <- as_variable %>%
   mutate(model = fct_reorder(model, .x = alloscore)) %>%
-  dplyr::filter(model == "COVIDhub-baseline") 
+  dplyr::filter(model == modelofinterest) 
 
 alloc_plot <- ggplot(multiloc_dat, aes(x=county, y=value, fill=name)) +
   geom_col(position="stack", alpha=1) +
@@ -239,7 +267,16 @@ alloc_plot <- ggplot(multiloc_dat, aes(x=county, y=value, fill=name)) +
   theme(plot.title = element_text(size=10.5), plot.subtitle = element_text(size=8),
                                                                                                         axis.title=element_text(size=8))
                                                                                             
- alloc_plot
+return(alloc_plot)
+
+}
+
+allocation_county_plot(alloscores_data=all_alloscores_data90, scores_data = all_scores,
+                       truth_data = truth_data, targetdateofinterest = "2022-01-01",
+                       horizonofinterest = "1", modelofinterest = "COVIDhub-baseline")
+allocation_county_plot(alloscores_data=all_alloscores_data90, scores_data = all_scores,
+                       truth_data = truth_data, targetdateofinterest = "2022-01-01",
+                       horizonofinterest = "1", modelofinterest = "COVIDhub-4_week_ensemble")
 ```
 
 Overall underallocation is calculated by summing this red-shaded underallocation across all counties (17,324 units of resource). On a similar graph of the oracle distribution (not shown), the red shaded areas will represent unavoidable underallocation, as the oracle distribution is assumed to be ideal. Given a resource constraint of 90%, it follows that an oracle scheme will inevitably underallocate resources by 10%, and so unavoidable underallocation is known to be 10% of true need (13,149 units). Allocation score is then calculated as the difference between these two quantities (total underallocation minus unavoidable underallocation; 4,175) to estimate avoidable resource underallocation due to the forecast predictions.
@@ -248,7 +285,7 @@ Notably, overallocation (shown in blue) is not directly counted by AS, but due t
 
 In the visualization above, marked overallocation of resources to San Bernandino, Stanislaus, and Kern Counties can be identified, as well as underallocation to San Diego County and the counties from Santa Clara County to San Mateo County on the graph. The use of the allocation score framework and its associated visualizations has the added benefit of facilitating such qualitative assessments and can therefore assist in identifying targets for which a forecast's predictions are weakest. Review of these results can help to identify data artifacts or other threats to forecast accuracy. \[**CA PEOPLE KNOW THE SOURCE OF THESE OVERPREDICTIONS? COULD POINT TO AS ILLUSTRATIVE**\]
 
-In practice, decision-makers may lack a definitive estimate of true resource availability. Furthermore, the calculation of AS from a single resource constraint may fail to capture resource distribution dynamics at higher or lower constraints. For this reason, the integrated allocation score is produced as an average of a range of possible resource constraints, which can be weighted based on perceived probability of each constraint. For this example, an unweighted mean (uniform weighting) of a 41 allocation scores from 70-110% of true need (92,044-144,642 units of resource) were calculated to produce an IAS of 12,284. As with AS, lower scores of IAS are indicative of better performing forecasts, and so this score may be compared to those of other forecasts for the same target date to assess model performance.
+In practice, decision-makers may lack a definitive estimate of true resource availability. Furthermore, the calculation of AS from a single resource constraint may fail to capture resource distribution dynamics at higher or lower constraints. For this reason, the integrated allocation score is produced as an average of a range of possible resource constraints, which can be weighted based on perceived probability of each constraint. For this example, an unweighted mean (uniform weighting) of 41 allocation scores from 70-110% of true need (92,044-144,642 units of resource) were calculated to produce an IAS of 12,284. As with AS, lower scores of IAS are indicative of better performing forecasts, and so this score may be compared to those of other forecasts for the same target date to assess model performance.
 
 # Methods
 
@@ -264,7 +301,7 @@ Ground truth counts of county-level incident cases were retrieved through the JH
 
 ## Model Selection
 
-Forecast submissions were deemed eligible for analysis if they included predictions for all 57 counties of interest on a given target date and horizon. Additionally, Forecast Hub ensembles (created via differing ensembling mechanisms from Hub forecast submissions) were dropped with the exception of the COVIDhub-4_week_ensemble.\[CITE DOCUMENTATION WHAT MAKES IT SPECIAL\] Additionally, the CU-nochange, CU-scenario_low, and CU-scenario_mid models were dropped, leaving only CU-select from among the compartmental forecasts submitted by Columbia University. According to the creators, the CU-select model was considered to be the most plausible scenario from among their submissions.[@pei] \[[CITE ZOLTAR]{.underline}\]
+Forecast submissions were deemed eligible for analysis if they included predictions for all 57 counties of interest on a given target date and horizon. Additionally, Forecast Hub ensembles (created via differing ensembling mechanisms from Hub forecast submissions) were dropped with the exception of the COVIDhub-4_week_ensemble.\[CITE DOCUMENTATION WHAT MAKES IT SPECIAL\] Additionally, the CU-nochange, CU-scenario_low, and CU-scenario_mid models were dropped, leaving only CU-select from among the compartmental forecasts submitted by Columbia University. According to the creators, the CU-select model was considered to be the most plausible scenario from among their submissions.[@pei] \[[CITE ZOLTAR]{.underline}\] Finally, models with submissions for fewer than half of the target dates of interest were excluded to ensure interpretability of forecast rankings.
 
 ![Selection process of models for inclusion in the allocation scoring analysis. Forecasts were eligible if they submitted predictions at the 1- and 3-week forecast horizons for all 57 California counties to the COVID-19 Forecast Hub for at least 4 weeks during the period of 12/18/2021 to 03/12/2022. Additional models from Columbia University were removed to include only their preferred forecast (CU-select). Ensembles from the Forecast Hub were also dropped, with the exception of the COVIDhub-4_week_ensemble model. Finally, additional forecasts/allocation schemes were produced for scoring: an ensemble forecast produced via uniform-weighted averaging of each date's non-Hub ensemble qualifying submissions (eligible-models-ensemble), resource allocation proportional to the most recent county case counts available at time of forecast (recent-case-counts), and resource allocation proportional to census population that ignores any epidemiological information (per-capita).](Model%20Selection.png){width="80%"}
 
@@ -282,7 +319,7 @@ In this method, first, the set of quantiles submitted to the Hub is used to inte
 
 ### Integrated Allocation Score
 
-For each respective target date and horizon, integrated allocation scores for forecasts were calculated using resource constraints ranging from 70% to 110% of ground truth case count (true need) at the respective target date (one allocation score for each percent between 70% and 110%, centered at 90% of true need, n = 41). A uniform-weighted integrated allocation score was used for most analyses, calculated as a mean of the 41 allocation scores. To evaluate the impact of probability weighting on IAS, uniform-weighted scores were compared to a normal-weighted score, with a distribution centered on the mean resource constraint (90% of true need) and a standard deviation calculated from the set of 41 resource levels.
+For each respective target date and horizon, integrated allocation scores for forecasts were calculated using resource constraints ranging from 70% to 110% of ground truth case count (true need) at the respective target date (one allocation score for each percent between 70% and 110%, centered at 90% of true need, n = 41). A uniform-weighted integrated allocation score was used for most analyses, calculated as a mean of the allocation scores at each of the 41 resource constraints. To evaluate the impact of probability weighting on IAS, uniform-weighted scores were compared to a normal-weighted score, calculated using a normal distribution centered on the mean resource constraint (90% of true need for each forecast date). For each forecast date, standard deviation was calculated by assuming that the constraints at the 2.5th and 97.5th percentiles are 4 standard deviations apart (as dictated by a standard normal distribution) and thereby calculating standard deviation as the difference between these values divided by 4.
 
 ```{r echo=FALSE, warning=FALSE, fig.cap= "Omicron Wave in California: Allocation Score Resource Constraints. The grey line represents 90% of true need, while the shaded area bounds 70%-110% of true need. Allocation scores were determined at 41 different resource constraint levels between 70% and 110% and averaged using both uniform- and normal-weighting to calculate integrated allocation scores."}
 
@@ -305,7 +342,8 @@ resourceconstraintplot <- ggplot(data=truth_data_ca, aes(x=target_end_date, y=va
   geom_point(size=0.5) + 
   geom_line() + 
   labs(x = "MMWR Week End Date", y ="Weekly Incident Cases") + 
-  scale_x_date(date_breaks = "1 week") + 
+  scale_x_date(breaks = seq(min(truth_data_ca$target_end_date),max(truth_data_ca$target_end_date),by="week"),
+               minor_breaks = NULL) + 
   theme_bw() + 
   theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 8),
         axis.text.y = element_text(size = 8),
@@ -318,12 +356,11 @@ resourceconstraintplot <- ggplot(data=truth_data_ca, aes(x=target_end_date, y=va
   
   
 resourceconstraintplot
-
 ```
 
 ### Comparisons Between IAS and Other Scores
 
-In addition to uniform-weighted IAS and normal-weighted IAS, forecasts were evaluated via weighted interval score (WIS) for each target date, county, and horizon.[@bracher2021] Mean WIS (MWIS) was calculated as the unweighted average WIS score across all 57 counties for a given target date and horizon. Spearman's $\rho$ was used to evaluate agreement in scores of models between scoring metrics, and Kendall's $\tau$ was used to evaluate agreement in rankings.
+In addition to uniform-weighted IAS and normal-weighted IAS, forecasts were evaluated via weighted interval score (WIS) for each target date, county, and horizon.[@bracher2021] Mean WIS (MWIS) was calculated as the unweighted average WIS score across all 57 counties for a given target date and horizon. Spearman's $\rho$ was used to evaluate pairwise agreement in scores of models between scoring measures, and Kendall's $\tau$ was used to evaluate agreement in rankings.
 
 ### Technical
 
@@ -331,7 +368,7 @@ All analyses were run in R version 4.6.1 using the `targets` package version 1.1
 
 # Results
 
-## Model Availability 
+## Model Availability
 
 ```{r echo=FALSE, warning=FALSE, fig.cap="Complete forecast submissions by model and date. Forecast submissions were considered complete if they provided predictions for all 57 counties of interest. Hub validation procedures required that forecasts in quantile format provide predictions across 7 quantiles in order to be accepted."}
 
@@ -351,10 +388,15 @@ pointestimatecompleteness <- pointestimatecompleteness %>% dplyr::mutate(FreqDis
   TRUE ~ NA))
 pointestimatecompleteness$Date <- as.factor(pointestimatecompleteness$Date)
 
+# Make fillers for the per-capita and recent-case-counts allocations
+other_models <- data.frame(Model = c("per-capita", "recent-case-counts"), Freq = c("57", "57"))
+dates_quantiles <- pointestimatecompleteness %>% 
+  dplyr::filter(Model == "COVIDhub-baseline") %>% select(-Model, -Freq) 
+other_models <- merge(other_models, dates_quantiles)
 
-plotcompleteness <- function(data, quantile) { 
+plotcompleteness <- function(data, quantile, other_models) { 
 data %>%
-  dplyr::filter(Quantile == quantile) %>%
+    rbind(other_models)  %>%    
   ggplot(aes(y=Model, x=Date, fill=FreqDiscrete), color= "#A6CEE3FF") +
   geom_tile(color= "#A6CEE3FF") + 
   scale_color_manual(
@@ -364,15 +406,18 @@ data %>%
                ), 
     labels = c("Prediction", "No Prediction"),
     aesthetics = "fill")  +
-  theme(axis.text.x=element_text(angle=60, hjust=1), legend.position = "none") + facet_wrap(~Horizon)
+  theme(axis.text.x=element_text(angle=60, hjust=1), legend.position = "none") +
+    labs(x = "MMWR Week End Date") + facet_wrap(~Horizon) +
+    scale_y_discrete(limits=rev)
 }
 
-completeness <- plotcompleteness(pointestimatecompleteness, quantile = 0.75)
+completeness <- plotcompleteness(pointestimatecompleteness, quantile = 0.75, other_models)
 completeness
 ```
-At the 1 and 3 week forecast horizons, a total of 10 forecasts/schemes were evaluated, including the eligible-models-ensemble forecast and the per-capita and recent-case-counts schemes. Figure 4 outlines eligible forecast submissions (defined as submissions providing the required quantiles for all 57 counties of interest) by target date. Following model selection, all eligible submissions were used in the analysis. All eligible models for a given target and horizon were incorporated into the eligible-models-ensemble, with the exception of the COVIDhub-4_week_ensemble, which had been produced via ensembling methods. [**\[model order in viz?\]**]{.underline} 
 
-##  Integrated Allocation Score
+At the 1 and 3 week forecast horizons, a total of 9 forecasts/schemes were evaluated, including the eligible-models-ensemble forecast and the per-capita and recent-case-counts schemes. Figure 4 outlines eligible forecast submissions (defined as submissions providing the required quantiles for all 57 counties of interest) by target date. Following model selection, all eligible submissions were used in the analysis. All eligible models for a given target and horizon were incorporated into the eligible-models-ensemble, with the exception of the COVIDhub-4_week_ensemble, which had been produced via ensembling methods. [**\[model order in viz? ADD PER CAP AND MOST RECENT DATA AS SCHEMES\]**]{.underline}
+
+## Integrated Allocation Score
 
 ```{r message=FALSE, warning = FALSE, echo = FALSE}
 # Test of whether scores were better than per-capita
@@ -412,41 +457,25 @@ beat_percap_target_IAS <- score_comparison_percap_IAS %>%
 
 ```
 
-```{r echo=FALSE, message=FALSE, warning=FALSE, include=FALSE, fig.width = 7, fig.align = 'center'}
+```{r echo=FALSE, message=FALSE, warning=FALSE, fig.width = 7, fig.align = 'center', fig.cap="Integrated allocation scores over time, at the 1- and 3-week horizons, based on uniform-weighted averages of the 70% - 110% resource constraint levels. Scores at both horizons are seen to track roughly with the epidemic curve. The forecasts frequently fail to outperform the per-capita resource allocation scheme (shown in pale orange) at the 3-week horizon, particularly at the peak of the epidemic."}
 
-# set chart's colors manually:
-#paletteer_d("RColorBrewer::Paired")
+# Old Colors
+# paletteer_d("RColorBrewer::Paired")
 # Colors are:
 #A6CEE3FF #1F78B4FF #B2DF8AFF #33A02CFF #FB9A99FF #E31A1CFF #FDBF6FFF #FF7F00FF #CAB2D6FF #6A3D9AFF #FFFF99FF #B15928FF 
-
 graphcolors <- c( "#1F78B4FF", "#B2DF8AFF", "#33A02CFF", "#FB9A99FF","#E31A1CFF","#A6CEE3FF",  "#FF7F00FF","#FDBF6FFF", "#CAB2D6FF", "#6A3D9AFF")
 
-# all_scores %>% dplyr::filter(horizon=="1") %>% ggplot(aes(x=target_end_date, y=IAS, group = model, color = model)) + scale_color_manual(
-#     values = graphcolors) +
-#   geom_point() + 
-#   geom_line() + 
-#   labs(x = "MMWR Week End Date", y ="Integrated Allocation Score") + 
-#   theme_bw() + 
-#   scale_x_date(date_breaks = "1 week") + 
-#   theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 8)) #+ scale_y_continuous(transform = "reverse")
-# 
-# all_scores %>% dplyr::filter(horizon=="3") %>% ggplot(aes(x=target_end_date, y=IAS, group = model, color = model)) + scale_color_manual(
-#     values = graphcolors) +
-#   geom_point() + 
-#   geom_line() + 
-#   labs(x = "MMWR Week End Date", y ="Integrated Allocation Score") + 
-#   theme_bw() + 
-#   scale_x_date(date_breaks = "1 week") + 
-#   theme(axis.text.x = element_text(angle = 45, vjust = 1.0, hjust = 1.0)) #+ scale_y_continuous(transform = "reverse")
-```
-
-```{r echo=FALSE, message=FALSE, warning=FALSE, fig.width = 7, fig.align = 'center', fig.cap="Integrated allocation scores over time, at the 1- and 3-week horizons, based on uniform-weighted averages of the 70% - 110% resource constraint levels. Scores at both horizons are seen to track roughly with the epidemic curve. The forecasts frequently fail to outperform the per-capita resource allocation scheme (shown in pale orange), particularly at the 3 week horizon."}
+# New Colors:
+# paletteer_d("ggsci::category10_d3")
+# Colors are: #1F77B4FF #FF7F0EFF #2CA02CFF #D62728FF #9467BDFF #8C564BFF #E377C2FF #7F7F7FFF #BCBD22FF #17BECFFF 
+graphcolors <-  c("#1F77B4FF", "#FF7F0EFF", "#2CA02CFF", "#D62728FF", "#9467BDFF", "#8C564BFF", "#E377C2FF", "#BCBD22FF", "#17BECFFF")
 
 all_scores %>% dplyr::mutate(horizon_display = dplyr::case_when(
       horizon == 1 ~ "1 Week Horizon",
       horizon == 3 ~ "3 Week Horizon",
       TRUE ~ NA)) %>% drop_na(horizon_display) %>%
-  ggplot(aes(x=as.factor(target_end_date), y=IAS, group = model, color = model)) + scale_color_manual(
+  ggplot(aes(x=as.factor(target_end_date), y=IAS, group = model, color = model)) +
+  scale_color_manual(
     values = graphcolors) +
   geom_point() + 
   geom_line() + 
@@ -455,14 +484,16 @@ all_scores %>% dplyr::mutate(horizon_display = dplyr::case_when(
   #scale_x_date(date_breaks = "1 week", limits = as.Date(c("2021-12-17","2022-03-18"))) + 
   theme(axis.text.x = element_text(angle = 45, vjust = 1.0, hjust = 1.0)) + 
   facet_wrap(~horizon_display, nrow=1) +
-  theme(legend.position= "right", legend.box="horizontal", legend.text=element_text(size=8), legend.margin=margin())
+  theme(legend.position = "right", legend.text=element_text(size=8), 
+        plot.title = element_text(size=10), legend.title = element_text(size=10),
+        axis.text = element_text(size = 8)) 
 ```
 
-Uniform-weighted IAS results were found to vary over time for each model (Figure 5), but largely scaled with the epidemic curve. At the 1-week horizon, the IAS values were typically found to be lower than those at the 3-week horizon, reflecting better performance. At both horizons, the scores of the forecasts as a whole were found to peak at the weeks of January 17th and 24th and be lowest at the start and end of the period examined, in general alignment with the epidemic curve of the omicron wave. Scores of individual forecasts, however, varied in their highest- and lowest-scoring weeks, as well as the shapes of their curves.
+Uniform-weighted IAS results were found to vary over time for each model (Figure 5), but largely scaled with the epidemic curve. At the 3-week horizon, the IAS values were typically found to be higher than those at the 1-week horizon, reflecting poorer forecast performance. At both horizons, the scores of the forecasts as a whole were found to peak at the weeks of January 15th and 22nd and be lowest at the start and end of the omicron wave, in general alignment with the epidemic curve. Scores of individual forecasts, however, varied in their highest- and lowest-scoring weeks, as well as the shapes of their curves.
 
-Being based on census populations instead of epidemiological data, the per-capita resource allocation scheme was used as a control and comparison prediction for scoring. At the 1-week horizon, models scored better than per-capita more frequently than at the 3-week horizon (56.5% at the 1-week horizon, 20.9% at the 3-week horizon). At the 1-week horizon, 6 of the 9 submitting models (COVIDhub-4_week_ensemble, CUBoulder-COVIDLSTM, CU-select,  eligible-models-ensemble, JHUAPL-Bucky, recent-case-counts) outscored per-capita in more than half of their predictions. In contrast, at the 3-week horizon, no model scored better than per-capita in more than half of its predictions. Of the models, only 3 forecasts outperformed per-capita in more than half of their predictions over both horizons: CUBoulder-COVIDLSTM (60.0%), recent-case-counts (57.7%), and COVIDhub-4_week_ensemble (53.8%). 
+Being based on census populations instead of epidemiological data, the per-capita resource allocation scheme was used as a control. At the 1-week horizon, models scored better than per-capita more frequently than at the 3-week horizon (58.3% at the 1-week horizon, 21.8% at the 3-week horizon). At the 1-week horizon, 6 of the 9 submitting models (COVIDhub-4_week_ensemble, CUBoulder-COVIDLSTM, CU-select, eligible-models-ensemble, JHUAPL-Bucky, recent-case-counts) outscored per-capita in more than half of their predictions. In contrast, at the 3-week horizon, only 1 model, CUBoulder-COVIDLSTM, scored better than per-capita in more than half of its predictions. Of the models, 4 outperformed per-capita in more than half of their predictions over both horizons: COVIDhub-4_week_ensemble (53.9%), eligible-models-ensemble (57.7%), recent-case-counts (61.5%), and CUBoulder-COVIDLSTM (64.0%).
 
-Of the forecast target dates, the December 18th target had the highest proportion of predictions (15 of 17 predictions, 88.2%) outperforming the per-capita allocation in IAS, followed by February 26th (11 of 16 predictions, 68.8%). In contrast, forecast predictions for all other target dates outperformed per-capita less than half of the time. Disparities between IAS values of the per-capita allocation scheme and the other models were particularly dramatic at the 3-week horizon during the peak weeks of the epidemic. For example, IAS values for many models were 3 or more times that of the per-capita allocation on January 22nd.
+Of the forecast dates, the week of December 18th had the highest proportion of predictions (15 of 17 predictions, 88.2%) outperforming the per-capita allocation in IAS, followed by February 26th (11 of 16 predictions, 68.8%) and March 5th (8 of 16 predictions, 50%). In contrast, forecast predictions for the peak weeks of the epidemic (January 15th, 22nd, and 29th) outperformed per-capita a third of the time or less. Disparities between IAS values of the per-capita allocation scheme and the other models were particularly dramatic at the 3-week horizon during the peak weeks of the epidemic.
 
 ```{r echo=FALSE, warning=FALSE, message=FALSE, fig.width = 7, fig.align = 'center', fig.cap = "Uniform-weighted IAS for selected forecasts/allocation schemes as a percentage of the score of the per-capita allocation scheme, by target date. At the 1-week horizon, both the ensemble models and the recent-case-counts allocation scheme are found to outperform the per-capita early in the epidemic. At the 3-week horizon, the per-capita scheme is found to outperform the forecasts dramatically at almost all target dates. Noteably, IAS scores of the recent-case-counts allocation are found to track very closely with those of the ensemble models, while the COVIDhub-baseline model (which uses the same recent case counts as its point estimate, but includes a prediction interval), shows worse performance."}
 
@@ -508,7 +539,8 @@ ggplot(data = relative_IAS,
   scale_color_manual(name="Model", 
                      values=c("per-capita"="black","COVIDhub-4_week_ensemble" = "#A6CEE3FF", 
                               "eligible-models-ensemble"="#E31A1CFF",
-                              "COVIDhub-baseline" = "#1F78B4FF", "recent-case-counts"="green4", "Other"= "grey"),
+                              "COVIDhub-baseline" = "#1F78B4FF", 
+                              "recent-case-counts"="green4", "Other"= "grey"),
                      labels = c("per-capita", "COVIDhub-4_week_ensemble", 
                                 "eligible-models-ensemble", "COVIDhub-baseline", "recent-case-counts", "Other"),
                      drop = F) +
@@ -527,11 +559,11 @@ ggplot(data = relative_IAS,
 
 ```
 
-Figure 6 displays the IAS values as a percentage of the IAS of the control per-capita allocation, with select models highlighted (COVIDhub-4_week_ensemble, eligible-models-ensemble, and COVIDhub-baseline). In this visualization, lines under the bolded black line (representing 100% of the per-capita IAS) indicate better allocation performance. Both ensemble models were found to frequently score lower than the per-capita allocation at the 1 week horizon, but not at the 3-week horizon. Scores were notably higher than the per-capita score on January 22nd (the peak of the epidemic) at the 3-week horizon, with all forecast IAS value at least double that of the per-capita allocation. The COVIDhub-baseline model was found to be outscored by the per-capita allocation and both ensembles for nearly all targets, but disparities were particularly dramatic at the 3 week horizon.
+Figure 6 displays the IAS values as a percentage of the IAS of the control per-capita allocation, with select models highlighted (COVIDhub-4_week_ensemble, COVIDhub-baseline, eligible-models-ensemble, and recent-case-counts). In this visualization, lines under the bolded black line (representing 100% of the per-capita IAS) indicate better performance. Both ensemble models were found to frequently score lower than the per-capita allocation at the 1 week horizon, but not at the 3-week horizon. Scores were notably higher than the per-capita score on January 22nd (the peak of the epidemic) at the 3-week horizon, with all forecasts scoring at least double that of the per-capita allocation via IAS. The COVIDhub-baseline model was found to be outscored by the per-capita allocation and both ensembles for nearly all forecast dates, but disparities were particularly dramatic at the 3 week horizon. [**\[CUBoulder-COVIDLSTM\]**]{.underline}
 
 ## Comparisons Between IAS and Other Scores
 
-```{r echo=FALSE, warning=FALSE, message=FALSE, fig.width = 7, fig.align = 'center', fig.cap = ""}
+```{r echo=FALSE, warning=FALSE, message=FALSE, fig.width = 7, fig.align = 'center', fig.cap = "Scatter plots of pairwise comparisons between scoring measures: (A) AS vs IAS, (B) AS vs MWIS, and (C) IAS vs MWIS. In all 3 comparisons, and particularly in the comparison between AS and IAS, strong positive correlations were found via Spearman's $\\rho$."}
 
 scattercompare_AS_IAS <- ggplot(data = all_scores, 
        aes(x=`alloscore`, y = `IAS`)) +
@@ -543,7 +575,7 @@ scattercompare_AS_IAS <- ggplot(data = all_scores,
   xlab("AS") + ylab("IAS") + stat_correlation(use_label("R", "p"),
                                                 method = "spearman",  size = 2.75) + 
   theme(legend.position = "bottom", legend.text=element_text(size=10), plot.title = element_text(size=10), 
-        axis.text = element_text(size = 8)) + 
+        axis.text = element_text(size = 8, angle = 45, vjust = 1.0, hjust = 1.0)) + 
     guides(colour = guide_legend(nrow = 3))
 scattercompare_AS_MWIS <- ggplot(data = all_scores, 
        aes(x=`alloscore`, y = `MWIS`)) +
@@ -555,7 +587,7 @@ scattercompare_AS_MWIS <- ggplot(data = all_scores,
   xlab("AS") + ylab("MWIS") + stat_correlation(use_label("R", "p"),
                                                 method = "spearman",  size = 2.75) + 
   theme(legend.position = "bottom", legend.text=element_text(size=10), plot.title = element_text(size=10), 
-        axis.text = element_text(size = 8)) + 
+        axis.text = element_text(size = 8, angle = 45, vjust = 1.0, hjust = 1.0)) + 
     guides(colour = guide_legend(nrow = 3))
 scattercompare_IAS_MWIS <- ggplot(data = all_scores, 
        aes(x=`IAS`, y = `MWIS`)) +
@@ -567,7 +599,7 @@ scattercompare_IAS_MWIS <- ggplot(data = all_scores,
   xlab("IAS") + ylab("MWIS") + stat_correlation(use_label("R", "p"),
                                                 method = "spearman", size = 2.75) + 
   theme(legend.position = "bottom", legend.text=element_text(size=10), plot.title = element_text(size=10),
-        axis.text = element_text(size = 8)) + 
+        axis.text = element_text(size = 8, angle = 45, vjust = 1.0, hjust = 1.0)) + 
     guides(colour = guide_legend(nrow = 3))
 
 (scattercompare_AS_IAS + scattercompare_AS_MWIS + scattercompare_IAS_MWIS) + plot_layout(guides = "collect") +
@@ -578,17 +610,18 @@ scattercompare_IAS_MWIS <- ggplot(data = all_scores,
 
 ```
 
-Comparisons between scoring metrics found strong monotonic correlation between the measures, with low scores in one metric predictive of low scores in the other two metrics. Figure 7 contains scatterplots that compare scores between pairs of metrics, with each dot indicating a set of predictions submitted for a given forecast date and time horizon by a single model. 
+Comparisons between scoring metrics found strong monotonic correlations between the scoring metrics, with low scores in one metric predictive of low scores in the other two metrics. In Figure 7, scores are compared between pairs of metrics via scatter plot, with each dot indicating the scores for a single submission. AS and IAS were found to have a near-perfect correlation by Spearman's $\rho$ ($\rho$ = 1.00, p \< 0.001), though both AS and IAS were also found to be strongly positively correlated with MWIS ($\rho$ = 0.91 and 0.90, respectively). No single model was notable for its outliers or deviations from the trends seen on the plots.
 
-```{r echo=FALSE, warning=FALSE, message=FALSE, fig.width = 7, fig.align = 'center', fig.cap = "Mean rank of models by scoring metric: allocation score (AS) at a resource constraint of 90% of the ground truth case count, uniform-weighted integrated allocation score (IAS) from  constraints ranging from 70%-110% of the ground truth, and mean WIS (MWIS) averaged across all counties analyzed. Because the recent-case-counts and per-capita allocation schemes are generated without the use of prediction intervals, MWIS was not calculated. The ensemble models (COVIDhub-4_week_ensemble and eligible-models-ensemble) are among the best-ranking models across all 3 scoring metrics, alongside CUBoulder-COVIDLSTM. The per-capita allocation scheme was also found to rank highly in AS and IAS, though MWIS could not be calculated. Models showing high mean rank in one scoring method are typically found to be among the highest ranking in other metrics, though outliers exist, such as FAIR-NRAR at the 1-week horizon, and CU-select at the 3-week horizon."}
+```{r echo=FALSE, warning=FALSE, message=FALSE, fig.width = 7, fig.align = 'center', fig.cap = "Mean rank (over dates and horizons (A) and over dates(B)) of models by scoring metric for AS, IAS, and MWIS, by model. Because the recent-case-counts and per-capita allocation schemes are generated without the use of prediction intervals, MWIS was not calculated. The ensemble models (COVIDhub-4_week_ensemble and eligible-models-ensemble) are among the best-ranking models across all 3 scoring metrics, alongside CUBoulder-COVIDLSTM. The per-capita allocation scheme was also found to rank highly in AS and IAS, though MWIS could not be calculated. Models showing high mean rank in one scoring method are typically found to be among the highest ranking in other metrics, though outliers exist, such as FAIR-NRAR at the 1-week horizon, and CU-select at the 3-week horizon."}
 
 # Mean rank MWIS vs AS90% vs IAS
-meanranks <- all_scores %>% group_by(model) %>% 
-  summarise("MWIS" = mean(MWIS_rank, na.rm=TRUE),
-            "AS" = mean(allo_rank, na.rm=TRUE),
-            "IAS" = mean(ias_rank, na.rm=TRUE)) %>% 
+meanranks_wide <- all_scores %>% group_by(model) %>% 
+  summarise("MWIS" = mean(MWIS_rank_std, na.rm=TRUE),
+            "AS" = mean(allo_rank_std, na.rm=TRUE),
+            "IAS" = mean(ias_rank_std, na.rm=TRUE)) %>% 
   mutate_all(~ifelse(is.nan(.), NA, .)) %>%
-  rename("Model" = model) %>%
+  rename("Model" = model) 
+meanranks <- meanranks_wide %>%
   pivot_longer(!Model, names_to = "Score", values_to = "Mean Rank") %>%
   ungroup()
 
@@ -597,18 +630,22 @@ meanranks_plot <- ggplot(data= meanranks, aes(x=Score, y=`Mean Rank`, group = Mo
     values = graphcolors) +
   geom_point() + 
   geom_line() + 
-  scale_y_reverse(limits = c(1, 8), breaks=1:8, minor_breaks=NULL) + 
+  #scale_y_reverse(limits = c(1, 8), breaks=1:8, minor_breaks=NULL) + 
   theme_bw() 
 
 # By Horizon
 meanranks_horizon <- all_scores %>% group_by(model, horizon) %>% 
-  summarise("MWIS" = mean(MWIS_rank, na.rm=TRUE),
-            "AS" = mean(allo_rank, na.rm=TRUE),
-            "IAS" = mean(ias_rank, na.rm=TRUE)) %>% 
+  summarise("MWIS" = mean(MWIS_rank_std, na.rm=TRUE),
+            "AS" = mean(allo_rank_std, na.rm=TRUE),
+            "IAS" = mean(ias_rank_std, na.rm=TRUE)) %>% 
   drop_na(horizon) %>% 
-  rename("Model" = model, "Horizon" = horizon) %>%
-  pivot_longer(!c(Model,Horizon), names_to = "Score", values_to = "Mean Rank") %>%
-  ungroup() %>% mutate(`Mean Rank` = as.numeric(`Mean Rank`))
+  rename("Model" = model) %>%
+  pivot_longer(!c(Model, horizon), names_to = "Score", values_to = "Mean Rank") %>%
+  ungroup() %>% mutate(`Mean Rank` = as.numeric(`Mean Rank`)) %>% 
+  dplyr::mutate(horizon_display = dplyr::case_when(
+      horizon == 1 ~ "1-Week Horizon",
+      horizon == 3 ~ "3-Week Horizon",
+      TRUE ~ NA))
 
 meanranks_horizon_plot <- ggplot(data= meanranks_horizon, 
                                  aes(x=Score, y=`Mean Rank`, group = Model, color = Model)) +
@@ -616,15 +653,28 @@ meanranks_horizon_plot <- ggplot(data= meanranks_horizon,
     values = graphcolors) +
   geom_point() + 
   geom_line() + 
-  scale_y_reverse(limits = c(1, 10), breaks=1:10, minor_breaks=NULL) + 
-  theme_bw() + facet_wrap(~`Horizon`)
+  #scale_y_reverse(limits = c(1, 10), breaks=1:10, minor_breaks=NULL) + 
+  theme_bw() + facet_wrap(~horizon_display)
 
 (meanranks_plot / meanranks_horizon_plot) + plot_layout(guides = "collect") +
-  plot_annotation(tag_levels = "A")
+  plot_annotation(tag_levels = "A") & 
+  theme(legend.position = "right", legend.text=element_text(size=8), legend.key.size = unit(0.5, 'cm'),
+        legend.key.width =  unit(0.25, 'cm'), legend.title = element_text(size=10)) + 
+  labs(fill='Model') 
+
+
+# all
+kendall_meanrank_ASvsIAS <- cor.test(meanranks_wide$AS, meanranks_wide$IAS, 
+                       use = "pairwise.complete.obs", method = 'kendall')$estimate ## AS vs IAS
+kendall_meanrank_ASvsMWIS <- cor.test(meanranks_wide$AS, meanranks_wide$MWIS, 
+                       use = "pairwise.complete.obs", method = 'kendall')$estimate  ## AS vs MWIS
+kendall_meanrank_IASvsMWIS <- cor.test(meanranks_wide$IAS, meanranks_wide$MWIS, 
+                       use = "pairwise.complete.obs", method = 'kendall')$estimate ## IAS vs MWIS
+
 
 ```
 
-Comparison of mean rankings of models between scoring metrics (AS at the 90% resource constraint, uniform-weighted AS, and MWIS) found that mean rankings were frequently consistent between scores, with a few major outliers. In Figure 8, mean relative rankings for the 3 scoring metrics are visualized for all forecasts/allocation schemes, averaged across forecast dates and horizons (A) or across forecast dates and faceted by horizon (B). High- or low-ranking in one score was often maintained across the other scores: for example, the COVIDhub-4_week_ensemble and eligible-models-ensemble were found to be among the best-ranking models across all 3 scoring metrics, alongside CUBoulder-COVIDLSTM, while COVIDhub-baseline and UVA-ensemble were consistently among the lowest in mean rank. However, some mean ranks were notable exceptions: FAIR-NRAR and CU-select were found to have high mean ranks in AS and MWIS but low IAS mean ranks at the 1-week and 3-week horizons, respectively. Furthermore, at the 3-week horizon, JHUAPL-Bucky was found to have a low mean rank in AS and IAS, but rank highly in MWIS. 
+A comparison of mean ranks of models between scoring metrics (AS at the 90% resource constraint, uniform-weighted AS, and MWIS) found that mean ranks were consistent between AS and IAS, but sometimes differed in MWIS. In Figure 8, mean relative ranks (0 = worst scoring model, 1 = best scoring model) for the 3 scoring metrics are visualized, first averaged across both forecast dates and horizons (A), and then faceted by horizon (B). High- or low-ranking in a score was often maintained across the other scores: for example, the COVIDhub-4_week_ensemble, eligible-models-ensemble, recent-case-counts, and CUBoulder-COVIDLSTM forecasts were found to be among the best-ranking models across all 3 scoring metrics, while COVIDhub-baseline and UVA-ensemble were consistently among the lowest in mean rank. However, some mean ranks were notable exceptions: CU-select, FAIR-NRAR and JHUAPL-Bucky were found to have low mean ranks in AS and IAS but higher ranks in MWIS, due to ranking highly in MWIS at the 1-week (CU-select and FAIR-NRAR) and 3-week (CU-select and JHUAPL-Bucky) horizons.
 
 ```{r echo=FALSE, warning=FALSE, message=FALSE, include=FALSE, fig.width = 7, fig.align = 'center'}
 
@@ -679,14 +729,75 @@ Comparison <- c("1 week", "3 week")
 `IAS vs. MWIS` <- c(kendall_1wk_IASvsMWIS, kendall_3wk_IASvsMWIS)
 kendallcomparisons <- tibble(Comparison, `90% AS vs. IAS`, `90% AS vs. MWIS`, `IAS vs. MWIS`)
 
-# knitr::kable(kendallcomparisons,
-#              caption = "Kendall's $\\tau$ values for pairwise tests")
+# knitr::kable(kendallcomparisons, caption = "Kendall's $\\tau$ values for pairwise tests")
 ```
 
+```{r echo=FALSE, message=FALSE}
+
+# rank at every K percentage point
+all_as_ranks_by_k <- all_alloscores_data %>% 
+  group_by(model, K, target_end_date, horizon) %>% # absolute value calculation  done above
+  summarize(alloscore = sum(components), yobs = sum(y)) %>%
+  ungroup() %>%
+  group_by(K, target_end_date, horizon) %>%
+  mutate(nmodels = n(),
+         allo_rank = rank(alloscore, ties.method = "min"),
+         allo_rank_std = 1- (allo_rank-1)/(nmodels-1),
+         Constraint = as.factor(K/yobs)) %>% ungroup() %>%
+  group_by(model, Constraint, horizon) %>% 
+  summarize("Mean AS Rank" = mean(allo_rank_std)) %>% ungroup() %>%
+  mutate(Constraint = as.numeric(as.character(Constraint)))
+
+IAS_values <- all_alloscores_data %>%
+  group_by(model, K, horizon, target_end_date) %>%
+  summarize(`Allocation score` = sum(components)) %>%
+  group_by(model, horizon, target_end_date) %>%
+  summarize(IAS = mean(`Allocation score`))  %>%
+  group_by(horizon, target_end_date) %>%
+  mutate(ias_rank = rank(IAS, ties.method = "min"),
+         nmodels = n(),
+         ias_rank_std = 1- (ias_rank-1)/(nmodels-1)) %>% ungroup() %>%
+  group_by(model, horizon) %>%
+  summarize("Mean IAS Rank" = mean(ias_rank_std, na.rm=TRUE)) 
+
+  ggplot(data = all_as_ranks_by_k, aes(x=Constraint, y=`Mean AS Rank`, group = model, color = model)) + scale_color_manual(
+    values = graphcolors) +
+  geom_point() + 
+  geom_line() + 
+  geom_hline(data=IAS_values, aes(yintercept=`Mean IAS Rank`, group = model, color = model)) +
+  geom_vline(aes(xintercept = 0.90))  +
+  geom_vline(aes(xintercept = 1.0))  +
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1.0, hjust = 1.0)) + 
+  facet_wrap(~horizon) +
+  theme(legend.position= "right", legend.box="horizontal", legend.text=element_text(size=8), legend.margin=margin())
+  
+  
+  
+all_as_by_k <- all_alloscores_data %>% 
+  group_by(model, K, target_end_date, horizon) %>% # absolute value calculation  done above
+  summarize(alloscore = sum(components), yobs = sum(y)) %>%
+  ungroup() %>%
+  mutate(Constraint = as.factor(K/yobs)) %>%
+  group_by(model, Constraint, horizon) %>% 
+  summarize("Mean AS" = mean(alloscore)) %>% ungroup() %>%
+  mutate(Constraint = as.numeric(as.character(Constraint)))
+ggplot(data = all_as_by_k, aes(x=Constraint, y=`Mean AS`, group = model, color = model)) + scale_color_manual(
+    values = graphcolors) +
+  geom_point() + 
+  geom_line() + 
+  geom_vline(aes(xintercept = 0.90))  +
+  geom_vline(aes(xintercept = 1.0))  +
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1.0, hjust = 1.0)) + 
+  facet_wrap(~horizon) +
+  theme(legend.position= "right", legend.box="horizontal", legend.text=element_text(size=8), legend.margin=margin())
+
+```
 
 ## Uniform- vs. Normal-Weighting in IAS Calculation
 
-```{r echo=FALSE, warning=FALSE, message=FALSE}
+```{r echo=FALSE, warning=FALSE, message=FALSE, fig.cap = "Diagnosic Graph - Delete?"}
 
 # 1 week
 kendall_1wk_IASvsweighted <- cor.test(all_scores_paired$`IAS 1 week`, all_scores_paired$`Normal-weighted IAS 1 week`, 
@@ -696,35 +807,43 @@ kendall_3wk_IASvsweighted <- cor.test(all_scores_paired$`IAS 3 week`, all_scores
                        use = "pairwise.complete.obs", method = 'kendall')$estimate ## IAS vs IAS normal weighted
 ```
 
-Kendall's $\tau$ was used to evaluate agreement between model score rankings using IAS calculated via uniform weighting (mean) versus a normal distribution. Weights were centered on the mean resource constraint (90% of true need) and standard deviation was calculated as standard deviation of the set of resource constraint values used. IAS values between the two methods were found to be highly concordant in their model rankings, with $\tau$ values of 0.988 at the 1 week horizon, and 0.993 at the 3 week horizon.
+Kendall's $\tau$ was used to evaluate agreement between model score rankings using IAS calculated via uniform weighting (mean) versus a normal distribution. Weights were centered on the mean resource constraint for each forecast date (90% of true need at that date) and standard deviation was determined from the 2.5th and 97.5th percentile values of the set of resource constraints used, assumed to be 4 standard deviations apart on a standard normal distribution. IAS values between the two weighting methods were found to be highly concordant in their model rankings, with $\tau$ values of `r sprintf("%.3f", round(kendall_1wk_IASvsweighted,3))` for IAS scores at the 1 week horizon, and ``` r``sprintf("%.3f", round(kendall_3wk_IASvsweighted,3)) ``` for scores at the 3 week horizon.
 
 # Discussion
 
-```{r include=FALSE, message=FALSE, echo=FALSE}
-# Mean rankings - ISSUE: inconsistent number of models
-meanrank_all <- all_scores %>% drop_na(ias_rank) %>% group_by(model) %>% summarise(meanrank_ias = mean(ias_rank), meanrank_mwis = mean(MWIS_rank))
-meanrank_horizon <- all_scores %>% drop_na(ias_rank) %>% group_by(model, horizon) %>% summarise(meanrank_ias = mean(ias_rank), meanrank_mwis = mean(MWIS_rank))
-```
+In this analysis, we demonstrated the use the integrated allocation score to score forecasts of county-level incident COVID-19 case data during California's omicron wave. IAS values were found to scale approximately with the epidemic curve, with the highest scores for predictions of the wave's peak weeks, and scores at the 3-week forecast horizon were noticeably higher than those at the 1-week horizon, indicating poorer forecast performance at longer timescales. Comparison of forecast scores to controls found that forecasts frequently failed to outperform epidemiologically-naive resource allocation by population or by recent case data, suggesting areas for future forecast optimization. Finally, high-ranking models in IAS and AS generally were found to rank highly in MWIS and weighting method for IAS (uniform vs normal) was found to have little impact on model rankings.
 
-Compared with MWIS and AS at a 90% resource constraint, IAS values were found to be strongly positively associated with the other scoring measures. In particular, comparison of relative rankings via Kendall's $\tau$ found particularly close agreement between scores by uniform-weighted IAS and MWIS. Additionally, a comparison between IAS calculated via uniform- versus normal-weighting found the two metrics to rank forecasts essentially the same. \[[**TOO CASUAL?**]{.underline}\] With the exception of CU-Select (which was among the best by MWIS at both horizons but underperformed other models in IAS), forecast performance in IAS and MWIS were found to agree broadly, in spite of the two methods using very different evaluation criteria in their measures. Taken together, this broad alignment in rankings indicates agreement between methods and weighting strategies on which models performed "better" for the given targets. Of the forecasts evaluated, the ensemble models (COVIDhub-4_week_ensemble and eligible-models-ensemble) and CUBoulder-COVIDLSTM were among the highest ranking on average between both IAS and MWIS. This finding is in general alignment with findings with other forecasting metrics, as ensemble models are generally considered to outperform their constituent models at forecasting tasks \[[**CITE**]{.underline}\]
+## Scores
 
-However, when compared to a control "per-capita" resource distribution based solely on population and agnostic of epidemiological trends, the forecasts largely failed to outperform the control distribution on IAS. The worst performance, when visualized as IAS relative to the IAS of the per-capita allocation, was found to occur with target dates at the peak of epidemic, when public health decisions can be considered most critical due to high resource burdens and morbidity. During the periods prior to the epidemic and during the decrease, relative IAS results were mixed. This frequent failure of the models to beat the IAS of the per-capita allocation at critical points suggests that forecast-informed resource distribution in the counties of interest may have been of little value-added during the COVID-19 omicron wave.
+Absolute AS and IAS scores largely aligned with expectations for the allocation score as introduced by Gerding et al.[@gerding2024]. As seen in the original analysis, AS values were typically highest when the resource constraint was closest to the ground truth, peaking at the 100% constraint. \[[**INCLUDE IN SUPP?**]{.underline}\] Additionally, absolute AS and IAS values scaled with the epidemic curve, as scoring for each forecast date was conducted using constraints proportional to the ground truth, and so misallocation could be expected to scale accordingly. Finally, forecast scores were found to be higher at the 3-week horizon than the 1-week horizon, in alignment with the general trend of better forecast performance at shorter time horizons. \[[**CITE**]{.underline}\]
 
-Out of the models assessed, the two ensemble models assessed had some of the lowest scores and outscored the per-capita allocation with the highest frequency. While these models still underperformed during peak times in the epidemic, the forecasts demonstrated possible utility in allocation during the upswing and final weeks of the epidemic, particularly when forecasting at the 1 week horizon. IAS values at the 1-week horizon were found to be the lower than those at the 3-week horizon and more likely to outscore the per-capita allocation, implying that resource distribution decisions made with shorter-term forecasts more accurately addressed ground-truth need than those further in advance.
+## Rankings
+
+The comparison of forecast IAS values to those of control allocation schemes allowed for the assessment of value-added by forecasts in informing resource allocation decisions. In Figure 10, resource allocation strategies are arranged in increasing order of information synthesis. In the per-capita scheme, resources are distributed proportionally to county census population, agnostic of current epidemiological trends, while in the recent-case-counts scheme, resources are distributed proportionally to the most recently reported case counts at the time of forecast. Forecasts and ensemble forecasts introduce additional complexity, generating allocation decisions through the anticipation of future trends and dynamics. To do so, they utilize past information, known population and environmental parameters, and (in the case of ensemble forecasts) other forecasts. This hierarchy of information allows forecasts to be assessed for whether their additional complexity contributes to better allocation decision-making, when compared to less analytically sophisticated approaches. Both control allocation methods are common approaches to resource allocation in public health practice, and more sophisticated methods should aim to improve allocation accuracy over these. \[[**CITE**]{.underline}\]
+
+In this analysis, forecasts frequently failed to outperform either the per-capita or recent-case-counts control when evaluated by IAS. The worst performance, when visualized as IAS relative to the IAS of the per-capita allocation, was found to occur with target dates at the peak of epidemic, when public health decisions can be considered most critical due to high resource burdens and morbidity. During the periods prior to the epidemic and during the decrease, relative IAS results were mixed. From this, we conclude that many of the county-level forecasts would not have improved allocation decisions during this critical time period, compared to the control methods. Notable exceptions were the two COVIDhub ensemble forecasts, COVIDhub-4_week_ensemble and eligible-models-ensemble, and CUBoulder-COVIDLSTM, which frequently scored similarly to or better than the controls, though much of their better performance occurred during the weeks outside of the epidemic's peak.
+
+![Hierarchy of increasing information complexity in epidemic response resource allocation strategies. Census population-based allocation ignores all epidemiological information and relies entirely on population sizes. Allocation based on recent case counts reflects epidemiological conditions, but may be subject to data backfill and future changes in dynamics across locations. Forecasts attempt to account for backfill and often utilize multiple data streams to make their predictions for each location. Ensemble forecasts compile submissions from multiple forecasting teams in order to produce their predictions. In this analysis, allocations via census population (per-capita) and recent case reports (recent-case-counts) were used as controls against which forecasts and ensemble forecasts were evaluated.](Hierarchy%20of%20Information.png)
+
+The comparison of mean relative rankings of models between evaluation methods found general agreement between methods, but some notable exceptions. AS, IAS by uniform weighting, and IAS by normal-weighting produced equivalent model rankings. When scored by MWIS, another commonly-used forecast evaluation metric, rankings also remained relatively consistent, though some models were found to rank more highly than they had with the allocation scoring methods. Taken together, this broad alignment in rankings indicates a general agreement between the methods and weighting strategies about "better" models, though metrics may be found to disagree occasionally, due to differences in which qualities are valued by their methodologies.
+
+## Limitations
+
+This analysis contains several limitations. First and foremost, scoring by the integrated allocation score, while it attempts to ground forecasts in a decision-making context, still describes only abstract resources and distribution scenarios. Constraints used in this analysis were not intended to pertain to any specific apportionable resource, such as medicine or staffing, but rather were abstract units determined post-hoc from ground truth case counts and presented on the same unit scale. Furthermore, the translation of abstract resource units into real resources runs the risk of introducing feedback loops into the scoring method thought experiment. For example, a forecast-informed distribution of PPE could impact disease transmission in the subsequent weeks and quickly render earlier forecasts invalid. Because of this, care should be taken when applying the allocation scoring rule to ensure that any allocations made would not impact the eventual observed transmission. This could be reasonably assumed in some settings (e.g., ventilator allocation on 1-2 week ahead forecasts of incidence) but less reasonably assumed in others (e.g., short-term vaccination campaigns on later transmission). Further research would be necessary in order to bridge the gap between theoretical IAS and units of real world resources. However, qualitative assessments via an allocation score-like framework, such as the use of visualizations like Figure 1 (see [Introduction]), may be useful in order to identify "weak points": locations to which forecasts and policies alike frequently under/overallocate. Such an analysis may be of interest to public health users, as the quality and granularity of forecasts of small-population subgroups (such as counties) has been identified as an area of concern and a potential barrier to forecast adoption.[@rao2025]
+
+[**\[FIX PARAGRAPH\]**]{.underline} In addition, the distribution schemes scored in this analysis were assumed to come from perfect compliance to forecast predictions and their associated CDFs, which overlooks the complexity of real-world allocation schemes and the nuance with which forecasts are typically interpreted by officials. In practice, public health officials more frequently synthesize multiple information sources and models in order to make resource distribution decisions.\[[**CITE**]{.underline}\] Furthermore, these decisions may be swayed by political and institutional priorities, emotional reactions, news cycles, or personal bias.\[[**CITE**]{.underline}\] For this reason, as well as the previously-noted use of abstract resource units in the analysis, we hazard against use of the allocation score to interpret these forecast-based allocations as feasible policies. ***{I mostly agree with this paragraph and the acknowlegment that forecasts will not be the only input to decisions is value, but I also think that we need to emphasize that the allocation score is internally consistent. IF IT WERE the only decision input, then it would suggest a specific allocation strategy and that strategy can be scored. Other strategies could be scored as well, and while it is unrealistic to think that such a strategy could be put into place in real-time decision-making, it is kind of the "right" approach to take.}***
+
+Finally, the exclusion of Los Angeles County due to differences in supply lines prevents generalization of the results to forecasting for the state as a whole. Results must be evaluated as pertaining to forecasts made for the entire state minus Los Angeles. \[[**OPTIONAL: SUPPLEMENTAL MATERIAL WITH SAME ANALYSIS WITH LA COUNTY? COULD RUN BUT NEED TO NOTE VERY BLUNTLY THAT IT SHOULD BE TREATED WITH CAUTION**]{.underline}\]
+
+## Application
+
+In spite of these limitations, this analysis highlights the successful application of the IAS to an epidemiological context in which forecasts may be expected to inform allocation-related decisions, as well as possible directions for future work. The frequent failure of the forecasts in this study to outscore a population based-control suggests that it may be a meaningful to add IAS to existing routine forecast evaluation and optimization workflows. [**\[REQUIRES AN EASIER TO RUN IAS, HOWEVER\]**]{.underline} Further, through the use of the COVID-19 Forecast Hub or a similar platform, would be possible to evaluate and compare multiple forecasts via IAS and produce ensemble forecasts that weight based on recent IAS performance, similarly to how the COVIDhub-trained-ensemble weights its constituent forecasts by the inverse of MWIS. The performance of such IAS-optimized models remains a possible avenue for future forecast development.
+
+Because IAS rewards forecasts that correctly capture relative resource needs across locations, this scoring rule may prove meaningful to public health decision-makers evaluating forecasts as information sources for multi-location resource distribution efforts. This method produces a measurement of avoidable, unaddressed resource need in a scenario where the forecast directly determines policy, rewarding models that capture the relative rankings of needs correctly across the locations of interest. The direct translation of this scoring to politically-relevant metrics, such as money or resource waste, as well as the generation of models that optimize for resource allocation effectiveness, remain areas for future research and development.
 
 # Conclusions
 
 In this analysis, we demonstrate the use the integrated allocation score to score forecasts of county-level incident COVID-19 case data during California's omicron wave. Relative rankings of models by IAS were found to largely agree with those by MWIS, a frequently-used scoring rule. Additionally, comparison of mean-weighted IAS to scores by normal-weighting determined that weighting method made little difference in relative IAS rankings of models. The evaluation of the scores relative to a control allocation scheme agnostic of epidemiological trends (per-capita) allowed for measurement of the value-added in using the forecasts in resource distribution decisions, compared to solely population-based decision-making. Forecasts frequently failed to beat this control when evaluated by IAS, particularly at the height of the epidemic. From this, we infer that, compared to population-based allocation, the county-level forecasts would not have improved allocation decisions during this critical time period in the public health response. During the upswing of the epidemic and last weeks of the wave, however, these relative scores were mixed, suggesting possible value-added by some models.
-
-This analysis contains several limitations. First and foremost, scoring by the integrated allocation score, while it attempts to ground forecasts in a decision-making context, still describes only abstract resources and distribution scenarios. Constraints used in this analysis were not intended to pertain to any specific apportionable resource, such as medicine or staffing, but rather were abstract units determined post-hoc from ground truth case counts and presented on the same unit scale. The translation of abstract resource units into real resources runs the risk of introducing feedback loops into the scoring method thought experiment For example, a forecast-informed distribution of PPE could impact disease transmission in the subsequent weeks and quickly render earlier forecasts invalid. Because of this, the scores cannot be translated easily into waste in units of funding, person-hours, or other resources. Further research would be necessary in order to bridge the gap between theoretical IAS and units of real world resources. However, qualitative assessments via an allocation score-like framework, such as the use of visualizations like Figure 1 (see [Introduction]), may be useful in order to identify "weak points": locations to which forecasts and policies alike frequently under/overallocate. Such an analysis may be of interest to public health users, as the quality and granularity of forecasts of small-population subgroups (such as counties) has been identified as an area of concern and a potential barrier to forecast adoption.[@rao2025]
-
-In addition, the distribution schemes scored in this analysis were assumed to come from perfect compliance to forecast predictions and their associated CDFs, which overlooks the complexity of real-world allocation schemes and the nuance with which forecasts are typically interpreted by officials. In practice, public health officials more frequently synthesize multiple information sources and models in order to make resource distribution decisions.\[[**CITE**]{.underline}\] Furthermore, these decisions may be swayed by political and institutional priorities, emotional reactions, news cycles, or personal bias.\[[**CITE**]{.underline}\] For this reason, as well as the previously-noted use of abstract resource units in the analysis, we hazard against use of the allocation score to interpret these forecast-based allocations as feasible policies.
-
-Finally, the exclusion of Los Angeles County due to differences in supply lines prevents generalization of the results to forecasting for the state as a whole. Results must be evaluated as pertaining to forecasts made for the entire state minus Los Angeles. \[[**OPTIONAL: SUPPLEMENTAL MATERIAL WITH SAME ANALYSIS WITH LA COUNTY? COULD RUN BUT NEED TO NOTE VERY BLUNTLY THAT IT SHOULD BE TREATED WITH CAUTION**]{.underline}\]
-
-In spite of these limitations, this analysis highlights the successful application of the IAS to an epidemiologic context in which forecasts may be expected to inform allocation-related decisions, as well as possible directions for future work. The frequent failure of the forecasts in this study to outscore a population based-control suggests that it may be a meaningful to add IAS to existing routine forecast evaluation and optimization workflows. [**\[REQUIRES AN EASIER TO RUN IAS, HOWEVER\]**]{.underline} Further, through the use of the COVID-19 Forecast Hub or a similar platform, would be possible to evaluate and compare multiple forecasts via IAS and produce ensemble forecasts that weight based on recent IAS performance, similarly to how the COVIDhub-trained-ensemble weights its constituent forecasts by the inverse of MWIS. The performance of such IAS-optimized models remains a possible avenue for future forecast development.
-
-Because IAS rewards forecasts that correctly capture relative resource needs across locations, this scoring rule may prove meaningful to public health decision-makers evaluating forecasts as information sources for multi-location resource distribution efforts. This method produces a measurement of avoidable, unaddressed resource need in a scenario where the forecast directly determines policy, rewarding models that capture the relative rankings of needs correctly across the locations of interest. The direct translation of this scoring to politically-relevant metrics, such as money or resource waste, as well as the generation of models that optimize for resource allocation effectiveness, remain areas for future research and development.
 
 ```{r include = FALSE, message=FALSE, echo=FALSE, warning=FALSE}
 
@@ -1156,3 +1275,27 @@ knitr::kable(pearsoncomparisons,
 ```
 
 # Bibliography
+
+### Fix pipeline:
+
+X Drop FAIR
+
+X CU select - the dropped week... can I put this into the data cleaning pipeline
+
+Hubverse data conversion
+
+Rerun
+
+### Edits:
+
+Epi curve constraint graph + submissions by week graph - both supplement
+
+Graph with map California + big CA epi curve + individual county forecasts
+
+Another map? Over/underalloc colored in counties
+
+Send to Nick comments
+
+Rewrite abstrac + intro
+
+Once good, send to Tomas, Lauren, ALSO Matt, and Rebecca Borchering
